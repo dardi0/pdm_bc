@@ -1,0 +1,48 @@
+{
+  "name": "pdm-zk-circuits",
+  "version": "2.0.0",
+  "description": "Zero-Knowledge Circuits for Predictive Maintenance - Circom 2.x",
+  "main": "setup_zk.js",
+  "scripts": {
+    "install-circom": "node install_circom.js",
+    "setup": "node setup_zk.js",
+    "build": "node setup_zk.js",
+    "test": "node test_circuit.js",
+    "clean": "rm -rf build/",
+    "compile": "circom model_verification.circom --r1cs --wasm --sym -o build/",
+    "prove": "node generate_proof.js",
+    "verify": "node verify_proof.js"
+  },
+  "dependencies": {
+    "circomlib": "^2.0.5",
+    "snarkjs": "0.4.27",
+    "ffjavascript": "^0.3.0"
+  },
+  "devDependencies": {
+    "circom_tester": "^0.0.19",
+    "chai": "^4.3.7",
+    "mocha": "^10.2.0"
+  },
+  "keywords": [
+    "zk",
+    "circom",
+    "circom2",
+    "snarkjs",
+    "predictive-maintenance",
+    "blockchain",
+    "zero-knowledge"
+  ],
+  "author": "PDM Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "pdm-zk-circuits"
+  },
+  "circom": {
+    "version": "2.1.8",
+    "compiler": "circom"
+  }
+}
