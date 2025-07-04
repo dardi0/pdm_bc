@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 import warnings
 import os
 import logging
@@ -19,6 +21,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import time
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix
@@ -30,10 +33,13 @@ from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
 import tkinter as tk
 from tkinter import ttk, messagebox, font
+from dotenv import load_dotenv # 
+import os
 
 # Ganache Blockchain entegrasyonu
 try:
     from bc.blockchain_integration import initialize_ganache_integration, get_ganache_integration
+    from web3 import Web3
     BLOCKCHAIN_AVAILABLE = True
     print("🔐 Ganache Blockchain modülü yüklendi")
 except ImportError as e:
@@ -45,12 +51,27 @@ except ImportError as e:
 tf.get_logger().setLevel('ERROR')
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
-# Global değişkenler
+# --- GLOBAL VARIABLES & CONFIGURATION ---
+
+HOLESKY_RPC_URL = os.getenv("HOLESKY_RPC_URL")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+
+MODEL_PATH = Path("build/model.h5")
+SCALER_PATH = Path("build/scaler.joblib")
+DEPLOYMENT_INFO_PATH = Path("deployment_info.json")
+
+# EKSİK OLAN SATIR BU:
+ARTIFACTS_PATH = Path("artifacts/contracts/PdMSystem.sol/PdMSystem.json")
+
+# Global Değişkenler
 model = None
 scaler = None
 feature_names = None
 optimal_threshold = 0.5  # Cross validation ile hesaplanacak
 zk_pdm = None  # ZK Blockchain instance
+pdm_contract = None  # Holesky contract instance
+web3 = None  # Web3 instance
+admin_account = None  # Admin account address
 
 def setup_zk_blockchain():
     """ZK Blockchain bağlantısını kurar"""
@@ -253,8 +274,6 @@ def train_model():
         fold_true_labels.extend(y_fold_val.values)
         
         # Fold performansı (0.5 eşiği)
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
-        
         fold_accuracy = accuracy_score(y_fold_val, y_fold_pred)
         fold_precision = precision_score(y_fold_val, y_fold_pred, zero_division=0)
         fold_recall = recall_score(y_fold_val, y_fold_pred, zero_division=0)
@@ -841,12 +860,10 @@ class PredictiveMaintenance:
         welcome_label.pack(expand=True)
         
     def predict_failure(self):
-        """Arıza tahminini yapar"""
-        if model is None or scaler is None:
-            messagebox.showerror("Hata", "Model henüz eğitilmedi!")
-            return
-            
+        """Tahmin yapar, ZK ispatı üretir ve işlemi imzalayarak Sepolia'ya gönderir."""
         try:
+            if not all([model, scaler, pdm_contract, web3, admin_account]):
+                raise ConnectionError("Sistem hazır değil. Model veya blok zincir bağlantısı eksik.")
             # Kullanıcı verilerini al
             user_data = []
             
@@ -867,7 +884,7 @@ class PredictiveMaintenance:
             # Veriyi ölçeklendir
             user_data_scaled = scaler.transform(user_data)
             
-            # LSTM-CNN için yeniden şekillendir
+            # GRU-CNN için yeniden şekillendir
             user_data_reshaped = user_data_scaled.reshape(1, user_data_scaled.shape[1], 1)
             
             # Model tahminini yap
@@ -884,10 +901,71 @@ class PredictiveMaintenance:
                 prediction_reason = "Arıza Tipi Kuralları"
             else:
                 final_prediction = model_prediction_opt  # Optimal eşik kullan
-                prediction_reason = f"LSTM-CNN Model (Optimal Eşik: {optimal_threshold:.2f})"
+                prediction_reason = f"GRU-CNN Model (Optimal Eşik: {optimal_threshold:.2f})"
             
-            # ZK Blockchain'e kaydet (eğer aktifse)
-            self.record_prediction_to_zk(user_data[0], prediction_prob, final_prediction, prediction_reason)
+            # Holesky ağına blockchain kaydı (eğer bağlı ise)
+            if all([pdm_contract, web3, admin_account]):
+                try:
+                    print("🔗 Holesky blockchain işlemi oluşturuluyor ve imzalanıyor...")
+                    
+                    # 1. Nonce'ı (işlem sırasını) al
+                    nonce = web3.eth.get_transaction_count(admin_account)
+                    
+                    # 2. Prediction verilerini hazırla
+                    prediction_data = {
+                        "machine_id": int(time.time()) % 10000,
+                        "prediction": final_prediction,
+                        "probability": int(prediction_prob * 10000),  # 4 decimal precision
+                        "timestamp": int(time.time()),
+                        "air_temp": int(user_data[0][0] * 100),  # 2 decimal precision
+                        "process_temp": int(user_data[0][1] * 100),
+                        "rotation_speed": int(user_data[0][2]),
+                        "torque": int(user_data[0][3] * 100),
+                        "tool_wear": int(user_data[0][4])
+                    }
+                    
+                    # 3. ZK proof hash (basitleştirilmiş)
+                    proof_hash = web3.keccak(text=f"{prediction_data['machine_id']}{prediction_data['prediction']}{prediction_data['probability']}")
+                    
+                    # 4. Fonksiyon çağrısı için işlemi oluştur
+                    transaction = pdm_contract.functions.storePrediction(
+                        prediction_data['machine_id'],
+                        prediction_data['prediction'],
+                        prediction_data['probability'],
+                        proof_hash
+                    ).build_transaction({
+                        'from': admin_account,
+                        'nonce': nonce,
+                        'gas': 300000,  # Prediction için yeterli gas
+                        'gasPrice': web3.to_wei('20', 'gwei')  # Holesky için uygun gas price
+                    })
+                    
+                    # 5. İşlemi özel anahtarımızla imzala
+                    signed_txn = web3.eth.account.sign_transaction(transaction, private_key=PRIVATE_KEY)
+                    
+                    # 6. İmzalanmış işlemi ağa gönder
+                    tx_hash = web3.eth.send_raw_transaction(signed_txn.raw_transaction)
+                    
+                    print(f"⏳ İşlem gönderildi: {tx_hash.hex()}")
+                    
+                    # 7. İşlemin onaylanmasını bekle (opsiyonel)
+                    try:
+                        receipt = web3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                        if receipt.status == 1:
+                            print(f"✅ Holesky blockchain'e kaydedildi! Block: {receipt.blockNumber}")
+                            print(f"🔗 TX Hash: {tx_hash.hex()}")
+                        else:
+                            print("❌ Transaction başarısız!")
+                    except Exception as timeout_e:
+                        print(f"⏱️ Transaction timeout: {timeout_e}")
+                        print("ℹ️ Transaction ağda işleniyor olabilir")
+                        
+                except Exception as blockchain_e:
+                    print(f"❌ Blockchain kayıt hatası: {blockchain_e}")
+                    print("⚠️ Lokal tahmin devam ediyor...")
+            else:
+                # Ganache yedeği
+                self.record_prediction_to_zk(user_data[0], prediction_prob, final_prediction, prediction_reason)
             
             # Sonucu göster
             self.show_prediction_result(final_prediction, prediction_prob, user_data[0], prediction_reason, model_prediction_05, model_prediction_opt)
@@ -959,25 +1037,43 @@ class PredictiveMaintenance:
             print(f"❌ Blockchain kayıt hatası: {e}")
             print("⚠️ Blockchain kaydedilemedi - sadece local prediction yapıldı")
     
-    def initialize_blockchain_system(self):
-        """Ganache Blockchain sistemini başlatır"""
-        if not BLOCKCHAIN_AVAILABLE:
-            print("⚠️ Blockchain modülü mevcut değil")
-            return False
+    def initialize_system(self):
+        """Modeli yükler ve Sepolia test ağına bağlantı kurar."""
+        global model, scaler, pdm_contract, web3, admin_account
             
         try:
             # Ganache integration'ı başlat
             success = initialize_ganache_integration()
-            if success:
-                print("✅ Ganache Blockchain sistemi başlatıldı")
-                return True
-            else:
-                print("❌ Ganache bağlantısı kurulamadı")
-                return False
+            if DEPLOYMENT_INFO_PATH.exists():
+                self.status_queue.put("Holesky test ağına bağlanılıyor...")
                 
+                # YENİ: Ganache URL'si yerine Holesky URL'sini kullan
+                if not HOLESKY_RPC_URL:
+                    raise ValueError(".env dosyasında HOLESKY_RPC_URL bulunamadı.")
+                web3 = Web3(Web3.HTTPProvider(HOLESKY_RPC_URL))
+
+                if not web3.is_connected():
+                    raise ConnectionError("Holesky ağına bağlanılamadı.")
+                
+                # YENİ: Özel anahtardan hesabı al
+                if not PRIVATE_KEY:
+                    raise ValueError(".env dosyasında PRIVATE_KEY bulunamadı.")
+                account = web3.eth.account.from_key(PRIVATE_KEY)
+                admin_account = account.address # Artık bu bizim ana hesabımız
+
+                # ... (Kontrat ABI'ını ve adresini okuma kısmı aynı kalır)
+                with open(DEPLOYMENT_INFO_PATH) as f: info = json.load(f)
+                with open(ARTIFACTS_PATH) as f: pdm_artifact = json.load(f)
+                
+                pdm_contract = web3.eth.contract(address=info['pdm_system_address'], abi=pdm_artifact['abi'])
+
+                self.status_queue.put(f"✅ Holesky'ye bağlandı. Hesap: {admin_account[:10]}...")
+            else:
+                self.status_queue.put("⚠️ Deployment bilgisi bulunamadı.")
         except Exception as e:
-            print(f"❌ Blockchain başlatma hatası: {e}")
-            return False
+            self.status_queue.put(f"HATA: Başlatma hatası - {e}")
+        finally:
+            self.status_queue.put("INIT_DONE")
     
     # JSON log fonksiyonları kaldırıldı - Blockchain yeterli! 🔗
     def analyze_failure_type(self, input_data):
@@ -1577,8 +1673,17 @@ def main():
     root = tk.Tk()
     app = PredictiveMaintenance(root)
     
+    # Holesky blockchain sistemi başlat
+    print("🔗 Holesky blockchain sistemi başlatılıyor...")
+    try:
+        app.initialize_system()
+        print("✅ Sistem tamamen hazır!")
+    except Exception as e:
+        print(f"⚠️ Blockchain başlatma hatası: {e}")
+        print("ℹ️ Sistem sadece lokal modda çalışacak")
+    
     print("🎯 Arayüz hazır! Sensör verilerini girin ve arıza tespiti yapın.")
-    print("🔐 ZK Kayıt: Her tahmin otomatik olarak blockchain/log'a kaydedilecek")
+    print("🔐 Blockchain Kayıt: Her tahmin Holesky ağına kaydedilecek")
     root.mainloop()
 
 if __name__ == "__main__":
