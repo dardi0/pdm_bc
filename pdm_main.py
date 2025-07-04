@@ -24,7 +24,7 @@ import time
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, roc_curve, classification_report, confusion_matrix
 from imblearn.over_sampling import SMOTE
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
@@ -36,15 +36,15 @@ from tkinter import ttk, messagebox, font
 from dotenv import load_dotenv # 
 import os
 
-# Ganache Blockchain entegrasyonu
+# Holesky Blockchain entegrasyonu
 try:
-    from bc.blockchain_integration import initialize_ganache_integration, get_ganache_integration
     from web3 import Web3
+    import threading
     BLOCKCHAIN_AVAILABLE = True
-    print("🔐 Ganache Blockchain modülü yüklendi")
+    print("🔐 Holesky Blockchain modülü yüklendi")
 except ImportError as e:
     BLOCKCHAIN_AVAILABLE = False
-    print(f"⚠️ Ganache Blockchain modülü yüklenemedi: {e}")
+    print(f"⚠️ Holesky Blockchain modülü yüklenemedi: {e}")
     print("ℹ️ Web3 kütüphanesini kurmak için: pip install web3")
 
 # TensorFlow için ek ayarlar
@@ -53,12 +53,15 @@ tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 # --- GLOBAL VARIABLES & CONFIGURATION ---
 
-HOLESKY_RPC_URL = os.getenv("HOLESKY_RPC_URL")
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+# .env dosyasını yükle
+load_dotenv("bc/pk.env")
+
+HOLESKY_RPC_URL = os.getenv("Holesky_RPC_URL")
+PRIVATE_KEY = os.getenv("Private_Key")
 
 MODEL_PATH = Path("build/model.h5")
 SCALER_PATH = Path("build/scaler.joblib")
-DEPLOYMENT_INFO_PATH = Path("deployment_info.json")
+DEPLOYMENT_INFO_PATH = Path("holesky_deployment_info.json")
 
 # EKSİK OLAN SATIR BU:
 ARTIFACTS_PATH = Path("artifacts/contracts/PdMSystem.sol/PdMSystem.json")
@@ -73,49 +76,68 @@ pdm_contract = None  # Holesky contract instance
 web3 = None  # Web3 instance
 admin_account = None  # Admin account address
 
-def setup_zk_blockchain():
-    """ZK Blockchain bağlantısını kurar"""
-    global zk_pdm
+def setup_holesky_blockchain():
+    """Holesky Blockchain bağlantısını kurar"""
+    global pdm_contract, web3, admin_account
     
     if not BLOCKCHAIN_AVAILABLE:
         return False
     
+    if not all([HOLESKY_RPC_URL, PRIVATE_KEY]):
+        print("❌ .env dosyasında Holesky_RPC_URL veya Private_Key eksik!")
+        return False
+    
     try:
-        # ZK konfigürasyonu - Ganache bilgileriyle güncellendi
-        config = {
-            'web3_provider_url': 'http://127.0.0.1:7545',  # Ganache RPC Server
-            'contract_address': '0x5f40aCfA7013E773013085f8062b3cA53Ec9291',  # İlk Ganache hesabı
-            'zk_verifier_address': '0x446aab1d9877C91cd9C5BbC803718327E02A4590',  # İkinci Ganache hesabı
-            'private_key': '0x' + '0'*63 + '1'  # Test için basit key
-        }
+        print("🔗 Holesky testnet bağlantısı test ediliyor...")
         
-        # ZK instance oluştur - Ganache bağlantısı
-        print("🔐 ZK Blockchain bağlantısı test ediliyor...")
-        
-        # Önce basit Web3 bağlantısını test et
-        from web3 import Web3
-        try:
-            w3 = Web3(Web3.HTTPProvider(config['web3_provider_url']))
-            if w3.is_connected():
-                print(f"✅ Ganache bağlantısı başarılı: {config['web3_provider_url']}")
-                print(f"🆔 Chain ID: {w3.eth.chain_id}")
-                print(f"📦 Block Number: {w3.eth.block_number}")
-                accounts = w3.eth.accounts
-                if accounts:
-                    print(f"👤 Hesap Sayısı: {len(accounts)}")
-                    print(f"💰 İlk hesap balance: {w3.from_wei(w3.eth.get_balance(accounts[0]), 'ether')} ETH")
-                print("ℹ️ ZK entegrasyonu Ganache ile hazır!")
-                return True
-            else:
-                print("❌ Ganache bağlantısı başarısız")
-                return False
-            
-        except Exception as e:
-            print(f"❌ Ganache bağlantı hatası: {e}")
+        # Web3 bağlantısını kur
+        web3 = Web3(Web3.HTTPProvider(HOLESKY_RPC_URL))
+        if not web3.is_connected():
+            print("❌ Holesky ağına bağlanılamadı")
             return False
         
+        # Account bilgilerini al
+        account = web3.eth.account.from_key(PRIVATE_KEY)
+        admin_account = account.address
+        balance = web3.from_wei(web3.eth.get_balance(admin_account), 'ether')
+        
+        print(f"✅ Holesky testnet bağlantısı başarılı!")
+        print(f"🆔 Chain ID: {web3.eth.chain_id}")
+        print(f"📦 Block Number: {web3.eth.block_number}")
+        print(f"👤 Admin Account: {admin_account}")
+        print(f"💰 Bakiye: {balance:.4f} HolETH")
+        
+        # Contract bilgilerini yükle
+        try:
+            # Deployment info dosyasını kontrol et
+            if not DEPLOYMENT_INFO_PATH.exists():
+                print("⚠️ deployment_info.json bulunamadı - contract'lar yüklenmedi")
+                return True  # Bağlantı var ama contract yok
+            
+            # Contract'ları yükle
+            with open(DEPLOYMENT_INFO_PATH) as f:
+                deployment_info = json.load(f)
+            
+            with open(ARTIFACTS_PATH) as f:
+                pdm_artifact = json.load(f)
+            
+            pdm_contract = web3.eth.contract(
+                address=deployment_info['pdm_system_address'],
+                abi=pdm_artifact['abi']
+            )
+            
+            print(f"📋 PDM Contract: {deployment_info['pdm_system_address']}")
+            print(f"🔐 Verifier Contract: {deployment_info['groth16_verifier_address']}")
+            print("✅ Holesky blockchain sistemi tamamen hazır!")
+            
+        except Exception as contract_e:
+            print(f"⚠️ Contract yükleme hatası: {contract_e}")
+            print("ℹ️ Bağlantı var ama contract'lar kullanılamayabilir")
+        
+        return True
+        
     except Exception as e:
-        print(f"⚠️ ZK Blockchain bağlantısı kurulamadı: {e}")
+        print(f"❌ Holesky blockchain bağlantı hatası: {e}")
         return False
 
 def create_gru_cnn_model(input_shape, learning_rate=0.0005):
@@ -428,7 +450,6 @@ def train_model():
     y_pred_opt = (y_pred_prob.flatten() >= optimal_threshold).astype("int32")
     
     # Detaylı performans metrikleri (0.5 eşiği)
-    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
     
     test_accuracy = accuracy_score(y_test, y_pred.flatten())
     test_precision = precision_score(y_test, y_pred.flatten(), zero_division=0)
@@ -443,7 +464,6 @@ def train_model():
     test_f1_opt = f1_score(y_test, y_pred_opt, zero_division=0)
     
     # Confusion Matrix
-    from sklearn.metrics import confusion_matrix
     cm = confusion_matrix(y_test, y_pred.flatten())
     tn, fp, fn, tp = cm.ravel()
     
@@ -603,7 +623,6 @@ def train_model():
     plt.show()
     
     # 2. ROC Eğrisi
-    from sklearn.metrics import roc_curve
     
     _, ax = plt.subplots(figsize=(8, 6))
     
@@ -964,8 +983,7 @@ class PredictiveMaintenance:
                     print(f"❌ Blockchain kayıt hatası: {blockchain_e}")
                     print("⚠️ Lokal tahmin devam ediyor...")
             else:
-                # Ganache yedeği
-                self.record_prediction_to_zk(user_data[0], prediction_prob, final_prediction, prediction_reason)
+                print("⚠️ Holesky blockchain bağlantısı mevcut değil - sadece lokal tahmin yapıldı")
             
             # Sonucu göster
             self.show_prediction_result(final_prediction, prediction_prob, user_data[0], prediction_reason, model_prediction_05, model_prediction_opt)
@@ -976,104 +994,26 @@ class PredictiveMaintenance:
         except Exception as e:
             messagebox.showerror("Hata", f"Tahmin hatası: {str(e)}")
     
-    def record_prediction_to_zk(self, input_data, prediction_prob, final_prediction, prediction_reason):
-        """Prediction'ı Ganache Blockchain'e kaydeder"""
-        
-        if not BLOCKCHAIN_AVAILABLE:
-            print("⚠️ Blockchain entegrasyonu mevcut değil")
-            return
-        
-        print("🔐 Ganache Blockchain kaydı başlıyor...")
-        
-        try:
-            # Ganache integration'ı al
-            ganache = get_ganache_integration()
-            if not ganache:
-                print("❌ Ganache bağlantısı kurulamadı")
-                return
-            
-            # 1. Prediction data formatı
-            prediction_data = {
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "air_temperature": float(input_data[0]),
-                "process_temperature": float(input_data[1]),
-                "rotational_speed": int(input_data[2]),
-                "torque": float(input_data[3]),
-                "tool_wear": int(input_data[4]),
-                "machine_type": self.machine_type.get()[0],
-                "failure_probability": float(prediction_prob),
-                "prediction": int(final_prediction),
-                "model_type": "GRU-CNN",
-                "prediction_reason": prediction_reason,
-                "risk_level": "HIGH" if prediction_prob > 0.7 else "MEDIUM" if prediction_prob > 0.3 else "LOW",
-                "features_count": len(input_data),
-                "machine_id": int(time.time()) % 10000  # Unique machine ID
-            }
-            
-            print("⛓️ Transaction oluşturuluyor ve Ganache'e gönderiliyor...")
-            
-            # 2. Blockchain transaction oluştur ve GERÇEKTEN GÖNDER
-            tx_result, blockchain_data = ganache.record_and_send_prediction(prediction_data, 'engineer')
-            
-            if tx_result and blockchain_data:
-                print("🎯 BAŞARI! Ganache Blockchain'e kaydedildi!")
-                print(f"🔗 TX Hash: {tx_result['tx_hash']}")
-                print(f"📦 Block Number: {tx_result['block_number']}")
-                print(f"⛽ Gas Used: {tx_result['gas_used']}")
-                print(f"💰 Status: {'SUCCESS' if tx_result['status'] == 1 else 'FAILED'}")
-                print(f"📋 Machine ID: {blockchain_data['machine_id']}")
-                print(f"🎯 Data Commitment: {blockchain_data['data_commitment'][:18]}...")
-                print(f"🎯 Metadata Hash: {blockchain_data['metadata_hash'][:18]}...")
-                print(f"📊 Probability: {prediction_prob:.4f}")
-                print(f"🔒 Risk Level: {prediction_data['risk_level']}")
-                print(f"📍 Contract: {ganache.pdm_system_address}")
-                print("\n✅ Ganache GUI'de bu transaction'ı şimdi görebilirsiniz!")
-                print(f"   TX Hash: {tx_result['tx_hash']}")
-                print(f"   Block: {tx_result['block_number']}")
-            else:
-                print("❌ Transaction oluşturulamadı veya gönderilemedi")
-                
-        except Exception as e:
-            print(f"❌ Blockchain kayıt hatası: {e}")
-            print("⚠️ Blockchain kaydedilemedi - sadece local prediction yapıldı")
+
     
     def initialize_system(self):
-        """Modeli yükler ve Sepolia test ağına bağlantı kurar."""
+        """Holesky blockchain bağlantısını başlatır."""
         global model, scaler, pdm_contract, web3, admin_account
             
         try:
-            # Ganache integration'ı başlat
-            success = initialize_ganache_integration()
-            if DEPLOYMENT_INFO_PATH.exists():
-                self.status_queue.put("Holesky test ağına bağlanılıyor...")
-                
-                # YENİ: Ganache URL'si yerine Holesky URL'sini kullan
-                if not HOLESKY_RPC_URL:
-                    raise ValueError(".env dosyasında HOLESKY_RPC_URL bulunamadı.")
-                web3 = Web3(Web3.HTTPProvider(HOLESKY_RPC_URL))
-
-                if not web3.is_connected():
-                    raise ConnectionError("Holesky ağına bağlanılamadı.")
-                
-                # YENİ: Özel anahtardan hesabı al
-                if not PRIVATE_KEY:
-                    raise ValueError(".env dosyasında PRIVATE_KEY bulunamadı.")
-                account = web3.eth.account.from_key(PRIVATE_KEY)
-                admin_account = account.address # Artık bu bizim ana hesabımız
-
-                # ... (Kontrat ABI'ını ve adresini okuma kısmı aynı kalır)
-                with open(DEPLOYMENT_INFO_PATH) as f: info = json.load(f)
-                with open(ARTIFACTS_PATH) as f: pdm_artifact = json.load(f)
-                
-                pdm_contract = web3.eth.contract(address=info['pdm_system_address'], abi=pdm_artifact['abi'])
-
-                self.status_queue.put(f"✅ Holesky'ye bağlandı. Hesap: {admin_account[:10]}...")
+            print("🔗 Holesky blockchain sistemi başlatılıyor...")
+            
+            # Holesky blockchain bağlantısını kur
+            success = setup_holesky_blockchain()
+            
+            if success:
+                print("✅ Holesky blockchain sistemi başarıyla başlatıldı!")
             else:
-                self.status_queue.put("⚠️ Deployment bilgisi bulunamadı.")
+                print("⚠️ Holesky blockchain başlatılamadı - sistem lokal modda çalışacak")
+                
         except Exception as e:
-            self.status_queue.put(f"HATA: Başlatma hatası - {e}")
-        finally:
-            self.status_queue.put("INIT_DONE")
+            print(f"❌ Sistem başlatma hatası: {e}")
+            print("⚠️ Sistem lokal modda çalışacak")
     
     # JSON log fonksiyonları kaldırıldı - Blockchain yeterli! 🔗
     def analyze_failure_type(self, input_data):
@@ -1497,32 +1437,26 @@ class PredictiveMaintenance:
         analysis_welcome.pack(expand=True)
     
     def show_blockchain_stats(self):
-        """Ganache Blockchain istatistiklerini gösterir"""
+        """Holesky Blockchain istatistiklerini gösterir"""
         if not BLOCKCHAIN_AVAILABLE:
             messagebox.showinfo("Bilgi", "⚠️ Blockchain entegrasyonu mevcut değil!\n\nWeb3 kütüphanesini kurmak için:\npip install web3")
             return
             
         try:
-            # Ganache integration'dan stats al
-            ganache = get_ganache_integration()
-            if not ganache:
-                messagebox.showerror("Hata", "❌ Ganache bağlantısı kurulamadı!\n\nGanache'in çalıştığından emin olun.")
-                return
-            
-            stats = ganache.get_system_stats()
-            if not stats:
-                messagebox.showerror("Hata", "❌ Blockchain istatistikleri alınamadı!")
+            # Holesky bağlantısını kontrol et
+            if not all([web3, admin_account]):
+                messagebox.showerror("Hata", "❌ Holesky bağlantısı kurulamadı!\n\nBlockchain sistemi başlatılmamış.")
                 return
                 
             # Popup pencere oluştur
             stats_window = tk.Toplevel(self.root)
-            stats_window.title("🔗 Ganache Blockchain İstatistikleri")
+            stats_window.title("🔗 Holesky Blockchain İstatistikleri")
             stats_window.geometry("650x550")
             stats_window.configure(bg='#2c3e50')
             
             # Başlık
             title_label = tk.Label(stats_window, 
-                                  text="🔐 GANACHE BLOCKCHAIN İSTATİSTİKLERİ", 
+                                  text="🔐 HOLESKY BLOCKCHAIN İSTATİSTİKLERİ", 
                                   font=('Arial', 16, 'bold'), 
                                   bg='#2c3e50', 
                                   fg='white')
@@ -1536,65 +1470,67 @@ class PredictiveMaintenance:
                                         fg='white')
             network_frame.pack(fill='x', padx=20, pady=10)
             
-            tk.Label(network_frame, 
-                    text=f"📦 Block Number: {stats['block_number']}", 
-                    font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
+            # Network bilgilerini al
+            try:
+                chain_id = web3.eth.chain_id
+                block_number = web3.eth.block_number
+                balance = web3.from_wei(web3.eth.get_balance(admin_account), 'ether')
+                
+                tk.Label(network_frame, 
+                        text=f"📦 Block Number: {block_number}", 
+                        font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
+                
+                tk.Label(network_frame, 
+                        text=f"🌐 Network: Holesky Testnet (Chain ID: {chain_id})", 
+                        font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
+                
+                tk.Label(network_frame, 
+                        text=f"👤 Admin Account: {admin_account}", 
+                        font=('Arial', 9), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
+                
+                tk.Label(network_frame, 
+                        text=f"💰 Bakiye: {balance:.4f} HolETH", 
+                        font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
+                
+            except Exception as e:
+                tk.Label(network_frame, 
+                        text=f"❌ Network bilgisi alınamadı: {e}", 
+                        font=('Arial', 10), bg='#34495e', fg='#e74c3c').pack(anchor='w', padx=10, pady=2)
             
-            tk.Label(network_frame, 
-                    text=f"🌐 Network: Ganache (Local)", 
-                    font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
-            
-            tk.Label(network_frame, 
-                    text=f"📍 PDM Contract: {ganache.pdm_system_address}", 
-                    font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
-            
-            tk.Label(network_frame, 
-                    text=f"🔐 Verifier Contract: {ganache.groth16_verifier_address}", 
-                    font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
-            
-            # PDM System istatistikleri
-            pdm_frame = tk.LabelFrame(stats_window, 
-                                    text="📊 PDM System İstatistikleri", 
-                                    font=('Arial', 12, 'bold'), 
-                                    bg='#34495e', 
-                                    fg='white')
-            pdm_frame.pack(fill='x', padx=20, pady=10)
-            
-            tk.Label(pdm_frame, 
-                    text=f"👥 Toplam Kullanıcı: {stats['total_users']}", 
-                    font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
-            
-            tk.Label(pdm_frame, 
-                    text=f"👷 Mühendis Sayısı: {stats['engineer_count']}", 
-                    font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
-            
-            tk.Label(pdm_frame, 
-                    text=f"📊 Sensor Data Sayısı: {stats['data_counter']}", 
-                    font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
-            
-            tk.Label(pdm_frame, 
-                    text=f"🤖 Kayıtlı Model Sayısı: {stats['model_counter']}", 
-                    font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
-            
-            # Account bilgileri
-            accounts_frame = tk.LabelFrame(stats_window, 
-                                         text="💰 Account Bakiyeleri", 
+            # Contract bilgileri
+            contract_frame = tk.LabelFrame(stats_window, 
+                                         text="📋 Contract Bilgileri", 
                                          font=('Arial', 12, 'bold'), 
                                          bg='#34495e', 
                                          fg='white')
-            accounts_frame.pack(fill='x', padx=20, pady=10)
+            contract_frame.pack(fill='x', padx=20, pady=10)
             
-            tk.Label(accounts_frame, 
-                    text=f"👤 Admin: {stats['admin_balance']:.4f} ETH", 
-                    font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
-            
-            tk.Label(accounts_frame, 
-                    text=f"👷 Engineer: {stats['engineer_balance']:.4f} ETH", 
-                    font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
-            
-            tk.Label(accounts_frame, 
-                    text=f"🔨 Worker: {stats['worker_balance']:.4f} ETH", 
-                    font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
+            try:
+                # Deployment info'yu oku
+                if DEPLOYMENT_INFO_PATH.exists():
+                    with open(DEPLOYMENT_INFO_PATH) as f:
+                        deployment_info = json.load(f)
+                    
+                    tk.Label(contract_frame, 
+                            text=f"📍 PDM Contract: {deployment_info['pdm_system_address']}", 
+                            font=('Arial', 9), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
+                    
+                    tk.Label(contract_frame, 
+                            text=f"🔐 Verifier Contract: {deployment_info['groth16_verifier_address']}", 
+                            font=('Arial', 9), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
+                    
+                    tk.Label(contract_frame, 
+                            text=f"📅 Deploy Tarihi: {deployment_info.get('deployment_time', 'Bilinmiyor')}", 
+                            font=('Arial', 10), bg='#34495e', fg='white').pack(anchor='w', padx=10, pady=2)
+                else:
+                    tk.Label(contract_frame, 
+                            text="⚠️ Contract deployment bilgisi bulunamadı", 
+                            font=('Arial', 10), bg='#34495e', fg='#f39c12').pack(anchor='w', padx=10, pady=2)
+                    
+            except Exception as e:
+                tk.Label(contract_frame, 
+                        text=f"❌ Contract bilgisi alınamadı: {e}", 
+                        font=('Arial', 10), bg='#34495e', fg='#e74c3c').pack(anchor='w', padx=10, pady=2)
             
             # Prediction info
             info_frame = tk.LabelFrame(stats_window, 
@@ -1605,10 +1541,10 @@ class PredictiveMaintenance:
             info_frame.pack(fill='x', padx=20, pady=10)
             
             info_text = """💡 Her arıza tahmini yaptığınızda:
-• Prediction data'sı blockchain'e kaydedilir
-• Engineer account'undan transaction gönderilir
-• Ganache GUI'de transaction'ı görebilirsiniz
-• Gas fee otomatik hesaplanır"""
+• Prediction data'sı Holesky blockchain'e kaydedilir
+• ZK proof hash oluşturulur ve doğrulanır
+• Transaction imzalanır ve ağa gönderilir
+• Holesky Etherscan'de transaction'ı görebilirsiniz"""
             
             tk.Label(info_frame, 
                     text=info_text,
@@ -1617,6 +1553,35 @@ class PredictiveMaintenance:
                     fg='#ecf0f1',
                     justify='left').pack(anchor='w', padx=10, pady=5)
             
+            # Etherscan linkler
+            if DEPLOYMENT_INFO_PATH.exists():
+                try:
+                    with open(DEPLOYMENT_INFO_PATH) as f:
+                        deployment_info = json.load(f)
+                    
+                    etherscan_frame = tk.LabelFrame(stats_window, 
+                                                  text="🔗 Etherscan Linkleri", 
+                                                  font=('Arial', 12, 'bold'), 
+                                                  bg='#34495e', 
+                                                  fg='white')
+                    etherscan_frame.pack(fill='x', padx=20, pady=10)
+                    
+                    pdm_link = f"https://holesky.etherscan.io/address/{deployment_info['pdm_system_address']}"
+                    verifier_link = f"https://holesky.etherscan.io/address/{deployment_info['groth16_verifier_address']}"
+                    
+                    tk.Label(etherscan_frame, 
+                            text=f"📋 PDM System Etherscan:\n{pdm_link}", 
+                            font=('Arial', 8), bg='#34495e', fg='#3498db', 
+                            justify='left').pack(anchor='w', padx=10, pady=2)
+                    
+                    tk.Label(etherscan_frame, 
+                            text=f"🔐 Verifier Etherscan:\n{verifier_link}", 
+                            font=('Arial', 8), bg='#34495e', fg='#3498db', 
+                            justify='left').pack(anchor='w', padx=10, pady=2)
+                    
+                except:
+                    pass
+            
             # Butonlar
             button_frame = tk.Frame(stats_window, bg='#2c3e50')
             button_frame.pack(pady=20)
@@ -1624,7 +1589,7 @@ class PredictiveMaintenance:
             # Initialize blockchain butonu
             init_button = tk.Button(button_frame, 
                                    text="🔄 Blockchain'i Yeniden Başlat", 
-                                   command=lambda: self.initialize_blockchain_system(),
+                                   command=lambda: self.initialize_system(),
                                    font=('Arial', 10, 'bold'), 
                                    bg='#3498db', 
                                    fg='white')
@@ -1644,16 +1609,16 @@ class PredictiveMaintenance:
 
 def main():
     """Ana fonksiyon"""
-    print("🚀 Arıza Tespit Sistemi - ZK Blockchain Entegrasyonlu")
+    print("🚀 Arıza Tespit Sistemi - Holesky Blockchain Entegrasyonlu")
     print("=" * 60)
     
-    # ZK Blockchain setup
-    print("🔐 ZK Blockchain sistemi kontrol ediliyor...")
-    zk_ready = setup_zk_blockchain()
-    if zk_ready:
-        print("✅ ZK modülü hazır")
+    # Holesky Blockchain setup
+    print("🔗 Holesky Blockchain sistemi kontrol ediliyor...")
+    holesky_ready = setup_holesky_blockchain()
+    if holesky_ready:
+        print("✅ Holesky modülü hazır")
     else:
-        print("⚠️ ZK modülü kapalı - sadece local log aktif")
+        print("⚠️ Holesky modülü kapalı - sadece local mod aktif")
     
     print("📊 Model eğitimi başlatılıyor, lütfen bekleyin...")
     
